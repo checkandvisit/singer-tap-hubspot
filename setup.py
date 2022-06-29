@@ -24,7 +24,7 @@ setup(name='tap-hubspot',
       },
       entry_points='''
           [console_scripts]
-          tap-hubspot=tap_hubspot:main
+          singer-tap-hubspot=tap_hubspot:main
       ''',
       packages=['tap_hubspot'],
       package_data = {

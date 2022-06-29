@@ -7,6 +7,8 @@ import re
 import sys
 import json
 # pylint: disable=import-error
+import dateutil.parser
+
 import attr
 import backoff
 import requests
@@ -213,8 +215,8 @@ def parse_custom_schema(entity_name, data):
 def get_custom_schema(entity_name):
     return parse_custom_schema(entity_name, request(get_url(entity_name + "_properties")).json())
 
-def get_v3_schema(entity_name):
-    url = get_url("deals_v3_properties")
+def get_v3_schema(entity_name, url_proxy):
+    url = get_url(url_proxy)
     return parse_custom_schema(entity_name, request(url).json()['results'])
 
 def get_abs_path(path):
@@ -238,7 +240,7 @@ def load_schema(entity_name):
         }
 
         if entity_name in ["deals"]:
-            v3_schema = get_v3_schema(entity_name)
+            v3_schema = get_v3_schema(entity_name, "deals_v3_properties")
             for key, value in v3_schema.items():
                 if any(prefix in key for prefix in V3_PREFIXES):
                     custom_schema[key] = value
@@ -404,16 +406,16 @@ def post_search_endpoint(url, data, params=None):
 
     return resp
 
-def merge_responses(v1_data, v3_data):
+def merge_responses(v1_data, v3_data, stream_id):
     for v1_record in v1_data:
-        v1_id = v1_record.get('dealId')
+        v1_id = v1_record.get(stream_id)
         for v3_record in v3_data:
             v3_id = v3_record.get('id')
             if str(v1_id) == v3_id:
                 v1_record['properties'] = {**v1_record['properties'],
                                            **v3_record['properties']}
 
-def process_v3_deals_records(v3_data):
+def process_and_filter_v3_records(v3_data):
     """
     This function:
     1. filters out fields that don't contain 'hs_date_entered_*' and
@@ -429,6 +431,22 @@ def process_v3_deals_records(v3_data):
         transformed_v3_data.append({**record, 'properties' : new_properties})
     return transformed_v3_data
 
+def process_v3_records(v3_data):
+    """
+    This function:
+    1. changes a key value pair in `properties` to a key paired to an
+       object with a key 'value' and the original value
+    """
+    transformed_v3_data = []
+    for record in v3_data:
+        new_properties = {
+            field_name : {'value': field_value}
+            for field_name, field_value in record['properties'].items()
+        }
+        transformed_v3_data.append({**record, 'properties' : new_properties})
+    return transformed_v3_data
+
+
 def get_v3_deals(v3_fields, v1_data):
     v1_ids = [{'id': str(record['dealId'])} for record in v1_data]
 
@@ -438,6 +456,17 @@ def get_v3_deals(v3_fields, v1_data):
     v3_url = get_url('deals_v3_batch_read')
     v3_resp = post_search_endpoint(v3_url, v3_body)
     return v3_resp.json()['results']
+
+def get_v3_tickets(v3_fields, v1_data):
+    v1_ids = [{'id': str(record['objectId'])} for record in v1_data]
+
+    # Send all necessary properties name to receive values
+    v3_body = {'inputs': v1_ids,
+               'properties': v3_fields}
+    v3_url = get_url('tickets_v3_batch_read')
+    v3_resp = post_search_endpoint(v3_url, v3_body)
+    return v3_resp.json()['results']
+
 
 #pylint: disable=line-too-long
 def gen_request(STATE, tap_stream_id, url, params, path, more_key, offset_keys, offset_targets, v3_fields=None):
@@ -455,13 +484,21 @@ def gen_request(STATE, tap_stream_id, url, params, path, more_key, offset_keys, 
                 raise RuntimeError("Unexpected API response: {} not in {}".format(path, data.keys()))
 
             if v3_fields:
-                v3_data = get_v3_deals(v3_fields, data[path])
-
-                # The shape of v3_data is different than the V1 response,
-                # so we transform v3 to look like v1
-                transformed_v3_data = process_v3_deals_records(v3_data)
-                merge_responses(data[path], transformed_v3_data)
-
+                if tap_stream_id == 'deals':
+                    v3_data = get_v3_deals(v3_fields, data[path])
+                    # The shape of v3_data is different than the V1 response,
+                    # so we transform v3 to look like v1
+                    transformed_v3_data = process_and_filter_v3_records(v3_data)
+                    merge_responses(data[path], transformed_v3_data, 'dealId')
+                elif tap_stream_id == 'tickets':
+                    v3_data = get_v3_tickets(v3_fields, data[path])
+                    # The shape of v3_data is different than the V1 response,
+                    # so we transform v3 to look like v1
+                    # transformed_v3_data = process_and_filter_v3_records(v3_data)
+                    transformed_v3_data = process_v3_records(v3_data)
+                    merge_responses(data[path], transformed_v3_data, 'objectId')
+                else:
+                    raise ValueError(f"invalid tap stream for v3 api endpoint: {tap_stream_id}")
             for row in data[path]:
                 counter.increment()
                 yield row
@@ -1104,6 +1141,70 @@ def sync_deal_pipelines(STATE, ctx):
     singer.write_state(STATE)
     return STATE
 
+def sync_tickets(STATE, ctx):
+    catalog = ctx.get_catalog_from_id(singer.get_currently_syncing(STATE))
+    mdata = metadata.to_map(catalog.get('metadata'))
+    bookmark_key = 'hs_lastmodifieddate'
+    start = utils.strptime_with_tz(get_start(STATE, "tickets", bookmark_key))
+    max_bk_value = start
+    LOGGER.info("sync_deals from %s", start)
+    most_recent_modified_time = start
+    params = {'limit': 100,
+              'includeAssociations': False,
+              'properties' : []}
+    
+    schema = load_schema("tickets")
+
+    singer.write_schema("tickets", schema, ["ticketId"], [bookmark_key], catalog.get('stream_alias'))
+    # Check if we should  include associations
+    for key in mdata.keys():
+        if 'associations' in key:
+            assoc_mdata = mdata.get(key)
+            if (assoc_mdata.get('selected') and assoc_mdata.get('selected') == True):
+                params['includeAssociations'] = True
+
+    v3_fields = None
+    has_selected_properties = mdata.get(('properties', 'properties'), {}).get('selected')
+    if has_selected_properties or has_selected_custom_field(mdata):
+        params['includeAllProperties'] = True
+        params['allPropertiesFetchMode'] = 'latest_version'
+
+        # Grab selected `hs_date_entered/exited` fields to call the v3 endpoint with
+        v3_fields = [breadcrumb[1].replace('property_', '')
+                     for breadcrumb, mdata_map in mdata.items()
+                     if breadcrumb
+                     and (mdata_map.get('selected') == True or has_selected_properties or has_selected_custom_field(mdata))
+                    #  and not any(prefix in breadcrumb[1] for prefix in V3_PREFIXES)]
+        ]
+
+    url = get_url('tickets_all')
+    with Transformer(UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING) as bumble_bee:
+        for row in gen_request(STATE, 'tickets', url, params, 'objects', "hasMore", ["offset"], ["offset"], v3_fields=v3_fields):
+            row_properties = row['properties']
+            modified_time = None
+            if bookmark_key in row_properties:
+                # Hubspot returns timestamps in millis
+                timestamp_millis = dateutil.parser.parse(
+                    row_properties[bookmark_key]['value']
+                ).timestamp()
+                modified_time = datetime.datetime.fromtimestamp(timestamp_millis, datetime.timezone.utc)
+            elif 'createdate' in row_properties:
+                # Hubspot returns timestamps in millis
+                timestamp_millis = dateutil.parser.parse(
+                    row_properties['createdate']['value']
+                ).timestamp()
+                modified_time = datetime.datetime.fromtimestamp(timestamp_millis, datetime.timezone.utc)
+            if modified_time and modified_time >= max_bk_value:
+                max_bk_value = modified_time
+
+            if not modified_time or modified_time >= start:
+                record = bumble_bee.transform(lift_properties_and_versions(row), schema, mdata)
+                singer.write_record("tickets", record, catalog.get('stream_alias'), time_extracted=utils.now())
+
+    STATE = singer.write_bookmark(STATE, 'tickets', bookmark_key, utils.strftime(max_bk_value))
+    singer.write_state(STATE)
+    return STATE
+
 @attr.s
 class Stream:
     tap_stream_id = attr.ib()
@@ -1128,7 +1229,8 @@ STREAMS = [
     Stream('campaigns', sync_campaigns, ["id"], None, 'FULL_TABLE'),
     Stream('contact_lists', sync_contact_lists, ["listId"], 'updatedAt', 'FULL_TABLE'),
     Stream('deal_pipelines', sync_deal_pipelines, ['pipelineId'], None, 'FULL_TABLE'),
-    Stream('engagements', sync_engagements, ["engagement_id"], 'lastUpdated', 'FULL_TABLE')
+    Stream('engagements', sync_engagements, ["engagement_id"], 'lastUpdated', 'FULL_TABLE'),
+    Stream('tickets', sync_tickets, ["ticketId"], 'lastUpdated', 'FULL_TABLE')
 ]
 
 def get_streams_to_sync(streams, state):

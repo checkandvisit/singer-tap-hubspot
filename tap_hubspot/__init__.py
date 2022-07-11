@@ -369,13 +369,15 @@ def request(url, params=None):
 def lift_properties_and_versions(record):
     for key, value in record.get('properties', {}).items():
         computed_key = "property_{}".format(key)
-        record[computed_key] = value
+        record[computed_key] = value        
         if isinstance(value, dict):
             versions = value.get('versions')
             if versions:
                 if not record.get('properties_versions'):
                     record['properties_versions'] = []
                 record['properties_versions'] += versions
+    if 'properties' in  record:
+        record.pop('properties')
     return record
 
 # backoff for Timeout error is already included in "requests.exceptions.RequestException"

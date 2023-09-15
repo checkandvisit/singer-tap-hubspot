@@ -63,6 +63,9 @@ To upload package execute :
 ```bash
 › python3 -m twine upload dist/*
 ```
+- Set your username to \_\_token\_\_
+- Set your password to the token value, including the pypi- prefix (found in s3://consolidation-pipeline/pypi/singer-cv-pypi-token)
+
 
 ## Catalogue configuration
 

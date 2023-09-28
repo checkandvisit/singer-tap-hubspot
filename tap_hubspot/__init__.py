@@ -829,7 +829,9 @@ def sync_tickets(STATE, ctx):
               'archived': False
               }
 
-    schema = load_schema(stream_id)
+    # schema = load_schema(stream_id)
+    schema = filter_selected_parameters(catalog['schema'], catalog['metadata'])
+
     singer.write_schema(stream_id, schema, [primary_key],
                         [bookmark_key], catalog.get('stream_alias'))
 
@@ -1171,72 +1173,6 @@ def sync_deal_pipelines(STATE, ctx):
     singer.write_state(STATE)
     return STATE
 
-def sync_tickets(STATE, ctx):
-    catalog = ctx.get_catalog_from_id(singer.get_currently_syncing(STATE))
-    mdata = metadata.to_map(catalog.get('metadata'))
-    bookmark_key = 'hs_lastmodifieddate'
-    start = utils.strptime_with_tz(get_start(STATE, "tickets", bookmark_key))
-    max_bk_value = start
-    LOGGER.info("sync_deals from %s", start)
-    most_recent_modified_time = start
-    params = {'limit': 100,
-              'includeAssociations': False,
-              'properties' : []}
-    
-    # schema = load_schema("tickets")
-    schema = filter_selected_parameters(catalog['schema'], catalog['metadata'])
-
-    singer.write_schema("tickets", schema, ["objectId"], [bookmark_key], catalog.get('stream_alias'))
-    # Check if we should  include associations
-    for key in mdata.keys():
-        if 'associations' in key:
-            assoc_mdata = mdata.get(key)
-            if (assoc_mdata.get('selected') and assoc_mdata.get('selected') == True):
-                params['includeAssociations'] = True
-
-    v3_fields = None
-    has_selected_properties = mdata.get(('properties', 'properties'), {}).get('selected')
-    if has_selected_properties or has_selected_custom_field(mdata):
-        params['includeAllProperties'] = True
-        params['allPropertiesFetchMode'] = 'latest_version'
-
-        # Grab selected `hs_date_entered/exited` fields to call the v3 endpoint with
-        v3_fields = [breadcrumb[1].replace('property_', '')
-                     for breadcrumb, _ in mdata.items()
-                     if breadcrumb
-                     and is_custom_field_selected(breadcrumb, mdata)
-                    #  and not any(prefix in breadcrumb[1] for prefix in V3_PREFIXES)]
-        ]
-
-    url = get_url('tickets_all')
-    with Transformer(UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING) as bumble_bee:
-        for row in gen_request(STATE, 'tickets', url, params, 'objects', "hasMore", ["offset"], ["offset"], v3_fields=v3_fields):
-            row_properties = row['properties']
-            modified_time = None
-            if bookmark_key in row_properties:
-                # Hubspot returns timestamps in millis
-                timestamp_millis = dateutil.parser.parse(
-                    row_properties[bookmark_key]['value']
-                ).timestamp()
-                modified_time = datetime.datetime.fromtimestamp(timestamp_millis, datetime.timezone.utc)
-            elif 'createdate' in row_properties:
-                # Hubspot returns timestamps in millis
-                timestamp_millis = dateutil.parser.parse(
-                    row_properties['createdate']['value']
-                ).timestamp()
-                modified_time = datetime.datetime.fromtimestamp(timestamp_millis, datetime.timezone.utc)
-            if modified_time and modified_time >= max_bk_value:
-                max_bk_value = modified_time
-
-            if not modified_time or modified_time >= start:
-                record = bumble_bee.transform(lift_properties_and_versions(row), schema, mdata)
-                singer.write_record("tickets", record, catalog.get('stream_alias'), time_extracted=utils.now())
-
-    STATE = singer.write_bookmark(STATE, 'tickets', bookmark_key, utils.strftime(max_bk_value))
-    singer.write_state(STATE)
-    return STATE
-
-
 def filter_selected_parameters(schema: dict, metadata: List[dict]) -> dict:
     """" use metadata from catalog to remove unecessary parameters in schema"""
     for prop in metadata:
@@ -1262,9 +1198,8 @@ STREAMS = [
     Stream('subscription_changes', sync_subscription_changes, ['timestamp', 'portalId', 'recipient'], 'startTimestamp', 'INCREMENTAL'),
     Stream('email_events', sync_email_events, ['id'], 'startTimestamp', 'INCREMENTAL'),
     Stream('contacts', sync_contacts, ["vid"], 'versionTimestamp', 'INCREMENTAL'),
-    Stream('deals', sync_deals, ["dealId"], 'property_hs_lastmodifieddate', 'INCREMENTAL'),
-    Stream('companies', sync_companies, ["companyId"], 'property_hs_lastmodifieddate', 'INCREMENTAL'),
     Stream('tickets', sync_tickets, ['id'], 'updatedAt', 'INCREMENTAL'),
+
 
     # Do these last as they are full table
     Stream('forms', sync_forms, ['guid'], 'updatedAt', 'FULL_TABLE'),
@@ -1272,9 +1207,10 @@ STREAMS = [
     Stream('owners', sync_owners, ["ownerId"], 'updatedAt', 'FULL_TABLE'),
     Stream('campaigns', sync_campaigns, ["id"], None, 'FULL_TABLE'),
     Stream('contact_lists', sync_contact_lists, ["listId"], 'updatedAt', 'FULL_TABLE'),
+    Stream('companies', sync_companies, ["companyId"], 'property_hs_lastmodifieddate', 'FULL_TABLE'),
+    Stream('deals', sync_deals, ["dealId"], 'property_hs_lastmodifieddate', 'FULL_TABLE'),
     Stream('deal_pipelines', sync_deal_pipelines, ['pipelineId'], None, 'FULL_TABLE'),
-    Stream('engagements', sync_engagements, ["engagement_id"], 'lastUpdated', 'FULL_TABLE'),
-    Stream('tickets', sync_tickets, ["objectId"], 'lastUpdated', 'FULL_TABLE')
+    Stream('engagements', sync_engagements, ["engagement_id"], 'lastUpdated', 'FULL_TABLE')
 ]
 
 def get_streams_to_sync(streams, state):
